@@ -88,6 +88,14 @@ const TLDR_MAX_TOKENS = 120;
 const TLDR_REQUEST_TIMEOUT_MS = 2_000;
 const TLDR_DISPLAY_UPDATE_INTERVAL_MS = 1_200;
 const TLDR_TARGET_SUMMARY_CHARS = 60;
+// Burst debouncing on the generation side: coalesce rapid-fire activities into
+// one model call. Quiet window catches short bursts; max wait surfaces progress
+// during continuous activity.
+const NORMAL_CHECKPOINT_QUIET_MS = 700;
+const NORMAL_CHECKPOINT_MAX_WAIT_MS = 2_500;
+// Defensive ceiling: even if the model ignores the length instruction, never
+// blast a large payload into the footer.
+const MAX_SAFE_TLDR_CHARS = 240;
 const CONFIG_PATH =
 	process.env.PI_BAR_CONFIG ?? join(homedir(), ".pi", "agent", "pi-bar.json");
 
@@ -236,11 +244,13 @@ function resolveTldrModelPreference(cwd: string): TldrModelPreference | undefine
 	return globalModel ? parseTldrModelSpec(globalModel) : undefined;
 }
 
+// Fallback order optimizes for low latency + low cost first. The TLDR path does
+// not need reasoning quality; codex/gpt-5.4-mini is fastest in practice.
 const FAST_TLDR_MODELS: readonly TldrModelPreference[] = [
-	{ provider: "anthropic", id: "claude-haiku-4-5" },
-	{ provider: "anthropic", id: "claude-haiku-4-5-20251001" },
 	{ provider: "openai-codex", id: "gpt-5.4-mini" },
 	{ provider: "openai-codex", id: "gpt-5.3-codex-spark" },
+	{ provider: "anthropic", id: "claude-haiku-4-5" },
+	{ provider: "anthropic", id: "claude-haiku-4-5-20251001" },
 ];
 
 function formatTldrModelKey(model: TldrModelPreference): string {
@@ -281,8 +291,19 @@ async function getFastTldrModelAuth(
 }
 
 function truncateText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars - 1)}…`;
+	if (maxChars <= 0) return "";
+	const chars = Array.from(text);
+	if (chars.length <= maxChars) return text;
+	if (maxChars === 1) return "…";
+
+	// Head+tail preserves both "what started" and "how it ended". Most useful for
+	// long bash/tool outputs where the final lines carry the outcome.
+	const retainedChars = maxChars - 1;
+	const headLength = Math.ceil(retainedChars / 2);
+	const tailLength = Math.floor(retainedChars / 2);
+	const head = chars.slice(0, headLength).join("");
+	const tail = tailLength > 0 ? chars.slice(-tailLength).join("") : "";
+	return `${head}…${tail}`;
 }
 
 function tailText(text: string, maxChars: number): string {
@@ -604,6 +625,12 @@ class FooterTldrEngine {
 	private displayTimer?: ReturnType<typeof setTimeout>;
 	private abortController?: AbortController;
 	private currentText: string | null = null;
+	// Normal-priority bursts wait for a quiet window before triggering a model
+	// call. Pi often emits many rapid activities (e.g. streaming reads); without
+	// debouncing we would hammer the TLDR model for intermediate states.
+	private pendingNormalCheckpoint?: TldrCheckpointJob;
+	private normalCheckpointTimer?: ReturnType<typeof setTimeout>;
+	private normalCheckpointBurstStartedAt?: number;
 
 	constructor(private readonly requestRender: () => void) {}
 
@@ -681,10 +708,63 @@ class FooterTldrEngine {
 	private cancelWork(): void {
 		if (this.displayTimer) clearTimeout(this.displayTimer);
 		this.displayTimer = undefined;
+		this.clearPendingNormalCheckpoint();
 		this.checkpointQueue.splice(0);
 		this.inFlightCheckpoint = undefined;
 		this.abortController?.abort();
 		this.abortController = undefined;
+	}
+
+	private clearNormalCheckpointTimer(): void {
+		if (!this.normalCheckpointTimer) return;
+		clearTimeout(this.normalCheckpointTimer);
+		this.normalCheckpointTimer = undefined;
+	}
+
+	private clearPendingNormalCheckpoint(): void {
+		this.clearNormalCheckpointTimer();
+		this.pendingNormalCheckpoint = undefined;
+		this.normalCheckpointBurstStartedAt = undefined;
+	}
+
+	private scheduleNormalCheckpoint(
+		ctx: ExtensionContext,
+		job: TldrCheckpointJob,
+	): void {
+		this.pendingNormalCheckpoint = job;
+		this.normalCheckpointBurstStartedAt ??= performance.now();
+		this.clearNormalCheckpointTimer();
+
+		const elapsedSinceBurstStarted =
+			performance.now() - this.normalCheckpointBurstStartedAt;
+		const maxWaitRemainingMs =
+			NORMAL_CHECKPOINT_MAX_WAIT_MS - elapsedSinceBurstStarted;
+		const delayMs = Math.max(
+			0,
+			Math.min(NORMAL_CHECKPOINT_QUIET_MS, maxWaitRemainingMs),
+		);
+
+		if (delayMs === 0) {
+			this.flushPendingNormalCheckpoint(ctx);
+			return;
+		}
+
+		this.normalCheckpointTimer = setTimeout(() => {
+			this.normalCheckpointTimer = undefined;
+			this.flushPendingNormalCheckpoint(ctx);
+		}, delayMs);
+	}
+
+	private flushPendingNormalCheckpoint(ctx: ExtensionContext): void {
+		const job = this.pendingNormalCheckpoint;
+		this.clearPendingNormalCheckpoint();
+		if (!job || job.runId !== this.runId) return;
+
+		this.checkpointQueue = this.checkpointQueue.filter(
+			(queued) => queued.displayPriority !== "normal",
+		);
+		this.checkpointQueue.push(job);
+		this.pump(ctx);
 	}
 
 	private enqueue(ctx: ExtensionContext, activity: TldrActivity): void {
@@ -697,12 +777,18 @@ class FooterTldrEngine {
 
 		if (job.displayPriority === "immediate") {
 			this.clearPendingDisplay();
+			this.clearPendingNormalCheckpoint();
 			this.lastRenderedText = "";
 			this.checkpointQueue.splice(0);
 			this.abortInFlightCheckpoint();
 			this.checkpointQueue.push(job);
-		} else if (job.displayPriority === "final") {
+			this.pump(ctx);
+			return;
+		}
+
+		if (job.displayPriority === "final") {
 			this.clearPendingDisplay();
+			this.clearPendingNormalCheckpoint();
 			this.checkpointQueue = this.checkpointQueue.filter(
 				(queued) => queued.displayPriority !== "normal",
 			);
@@ -710,14 +796,14 @@ class FooterTldrEngine {
 				this.abortInFlightCheckpoint();
 			}
 			this.checkpointQueue.push(job);
-		} else {
-			this.checkpointQueue = this.checkpointQueue.filter(
-				(queued) => queued.displayPriority !== "normal",
-			);
-			this.checkpointQueue.push(job);
+			this.pump(ctx);
+			return;
 		}
 
-		this.pump(ctx);
+		// Normal-priority: debounce into a single coalesced job. The latest job
+		// always wins because raw activity since the last accepted checkpoint is
+		// what the model already sees, regardless of which job triggers the call.
+		this.scheduleNormalCheckpoint(ctx, job);
 	}
 
 	private clearPendingDisplay(): void {
@@ -883,7 +969,13 @@ function checkpointSystemPrompt(job: TldrCheckpointJob): string {
 		job.displayPriority === "final"
 			? "Start with a past-tense verb."
 			: "Start with a present-tense -ing verb.";
-	return `Write one plain-English TLDR for a terminal coding agent.
+	// Frame the model as a human developer describing visible work, not an agent
+	// summarizing its own mechanics. Avoids leaks like tool names, prompt labels,
+	// or our internal scaffolding (activity indexes, prior checkpoints).
+	return `Write one plain-English TLDR for a Pi coding agent.
+Describe the work progress as if a human developer were doing it.
+Focus on the task activity and current outcome, not agent mechanics.
+Do not mention tools, tool calls, prompts, messages, model output, or implementation details.
 Use the prior TLDRs for context and the new activity for the update.
 Summarize the current state of work; do not narrate the history.
 If context is sparse, still summarize the available activity.
@@ -892,7 +984,6 @@ Return one concise status fragment under ${TLDR_TARGET_SUMMARY_CHARS} characters
 Omit subjects like "the agent" or "it".
 Prefer verb + direct object. Include outcome only if important.
 Do not address the user.
-Do not mention activity numbers, indexes, checkpoints, prior TLDRs, or phrases like "through activity".
 Output only the status fragment itself. No prefixes, labels, bullets, or quotes.
 Plain text only; no markdown, JSON, code, file paths, or tool names.
 ${tenseInstruction}`;
@@ -910,20 +1001,134 @@ function formatRawActivity(activity: TldrActivity): string {
 	return `- ${activity.text}`;
 }
 
+// Strips ANSI/CSI/OSC/DCS/SOS/PM/APC escape sequences from model output before
+// it lands in the terminal. The TLDR text is model-controlled and renders into
+// the footer; the system prompt asking for plain text is not a security
+// boundary, so we defensively remove terminal controls here.
+const ESC_BYTE = 0x1b;
+const BEL_BYTE = 0x07;
+const ST_BYTE = 0x9c;
+
+function isControlCharacter(code: number): boolean {
+	return (code >= 0x00 && code <= 0x1f) || (code >= 0x7f && code <= 0x9f);
+}
+
+function isWhitespaceControl(code: number): boolean {
+	return (
+		code === 0x09 ||
+		code === 0x0a ||
+		code === 0x0b ||
+		code === 0x0c ||
+		code === 0x0d
+	);
+}
+
+function skipCsiSequence(text: string, startIndex: number): number {
+	for (let index = startIndex; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code >= 0x40 && code <= 0x7e) return index + 1;
+	}
+	return text.length;
+}
+
+function skipStringControl(text: string, startIndex: number): number {
+	for (let index = startIndex; index < text.length; index++) {
+		const code = text.charCodeAt(index);
+		if (code === BEL_BYTE || code === ST_BYTE) return index + 1;
+		if (code === ESC_BYTE && text.charCodeAt(index + 1) === 0x5c) {
+			return index + 2;
+		}
+	}
+	return text.length;
+}
+
+function skipEscapeSequence(text: string, escapeIndex: number): number {
+	const nextCode = text.charCodeAt(escapeIndex + 1);
+	if (Number.isNaN(nextCode)) return escapeIndex + 1;
+
+	switch (nextCode) {
+		case 0x5b: // CSI: ESC [
+			return skipCsiSequence(text, escapeIndex + 2);
+		case 0x5d: // OSC: ESC ]
+		case 0x50: // DCS: ESC P
+		case 0x58: // SOS: ESC X
+		case 0x5e: // PM: ESC ^
+		case 0x5f: // APC: ESC _
+			return skipStringControl(text, escapeIndex + 2);
+		default:
+			if (
+				nextCode === 0x20 ||
+				nextCode === 0x23 ||
+				nextCode === 0x25 ||
+				(nextCode >= 0x28 && nextCode <= 0x2f)
+			) {
+				return Math.min(text.length, escapeIndex + 3);
+			}
+			return Math.min(text.length, escapeIndex + 2);
+	}
+}
+
+function stripTerminalControls(text: string): string {
+	let stripped = "";
+	for (let index = 0; index < text.length; ) {
+		const code = text.charCodeAt(index);
+
+		if (code === ESC_BYTE) {
+			index = skipEscapeSequence(text, index);
+			continue;
+		}
+		if (code === 0x9b) {
+			index = skipCsiSequence(text, index + 1);
+			continue;
+		}
+		if (
+			code === 0x90 ||
+			code === 0x98 ||
+			code === 0x9d ||
+			code === 0x9e ||
+			code === 0x9f
+		) {
+			index = skipStringControl(text, index + 1);
+			continue;
+		}
+		if (isControlCharacter(code)) {
+			if (isWhitespaceControl(code)) stripped += " ";
+			index++;
+			continue;
+		}
+
+		stripped += text[index];
+		index++;
+	}
+	return stripped.replace(/\s+/gu, " ").trim();
+}
+
+// Second layer: strip leaked prompt scaffolding such as "Through activity 12:".
+// The system prompt forbids these prefixes, but model outputs sometimes still
+// parrot them; the regex is narrow enough not to clip natural starts like
+// "Activity slowed after retry" or "Checkpointing release state".
 const LEAKED_PREFIX_PATTERN =
 	/^\s*(?:[-*•]\s*)?(?:(?:through\s+activity|activity|checkpoint)\s+\d+\s*[:.\-—–]\s*|(?:tldr|summary)\s*[:.\-—–]\s*)+/i;
-
 const LEADING_PUNCT_PATTERN = /^[\s\-—–•*:#.,;]+/;
 
-function sanitizeTldrText(text: string): string {
-	let cleaned = text.trim();
+function stripLeakedScaffolding(text: string): string {
+	let cleaned = text;
 	let previous: string;
 	do {
 		previous = cleaned;
 		cleaned = cleaned.replace(LEAKED_PREFIX_PATTERN, "").trim();
 		cleaned = cleaned.replace(LEADING_PUNCT_PATTERN, "").trim();
 	} while (cleaned !== previous && cleaned.length > 0);
-	return cleaned || text.trim();
+	return cleaned;
+}
+
+function sanitizeTldrText(
+	text: string,
+	maxChars = MAX_SAFE_TLDR_CHARS,
+): string {
+	const stripped = stripTerminalControls(text);
+	const cleaned = stripLeakedScaffolding(stripped) || stripped;
+	return truncateText(cleaned, maxChars);
 }
 
 function shouldShowStatus(key: string, filter: StatusFilter): boolean {
