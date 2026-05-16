@@ -330,17 +330,124 @@ export class TldrFactCollector {
 	}
 }
 
+export const ALLOWED_FIRST_WORDS_PROGRESSIVE = [
+	"Reviewing",
+	"Investigating",
+	"Exploring",
+	"Updating",
+	"Refining",
+	"Fixing",
+	"Implementing",
+	"Wrapping up",
+	"Bumping",
+	"Releasing",
+	"Preparing",
+	"Drafting",
+	"Resuming",
+	"Pulling",
+	"Surveying",
+	"Recording",
+] as const;
+export const ALLOWED_FIRST_WORDS_PAST = [
+	"Reviewed",
+	"Investigated",
+	"Explored",
+	"Updated",
+	"Refined",
+	"Fixed",
+	"Implemented",
+	"Wrapped up",
+	"Bumped",
+	"Released",
+	"Prepared",
+	"Drafted",
+	"Resumed",
+	"Pulled",
+	"Surveyed",
+	"Recorded",
+] as const;
+export const BANNED_FIRST_WORDS = [
+	"Read",
+	"Reading",
+	"Grep",
+	"Grepping",
+	"Listing",
+	"List",
+	"Counting",
+	"Counted",
+	"Extracting",
+	"Extracted",
+	"Displaying",
+	"Displayed",
+	"Editing",
+	"Edited",
+	"Writing",
+	"Wrote",
+	"Running",
+	"Ran",
+	"Publishing",
+	"Published",
+	"Capturing",
+	"Captured",
+	"Verifying",
+	"Verified",
+	"Verify",
+	"Validating",
+	"Validated",
+	"Validate",
+	"Checking",
+	"Checked",
+	"Check",
+	"Confirming",
+	"Confirmed",
+	"Confirm",
+	"Searching",
+	"Searched",
+	"Search",
+	"Finding",
+	"Found",
+	"Find",
+] as const;
+
 export function checkpointSystemPrompt(displayPriority: TldrDisplayPriority): string {
-	const tenseInstruction =
-		displayPriority === "final"
-			? "Start with a past-tense verb."
-			: "Start with a present-tense -ing verb.";
+	let tenseInstruction: string;
+	let goodExamples: string;
+	let allowedFirstWords: readonly string[];
+	if (displayPriority === "final") {
+		tenseInstruction = "Start with a past-tense verb describing what was completed.";
+		goodExamples = [
+			"- Updated footer summary behavior",
+			"- Investigated live TLDR regressions",
+			"- Refined sanitizer for stray prefixes",
+			"- Wrapped up extension release",
+		].join("\n");
+		allowedFirstWords = ALLOWED_FIRST_WORDS_PAST;
+	} else if (displayPriority === "immediate") {
+		tenseInstruction =
+			'Rephrase the user\'s new request as a concise present-progressive task clause. If the request is opaque (e.g. "continue", "go", "ok"), name the carry-over task with a noun (e.g. "Resuming refactor work"), not generic filler.';
+		goodExamples = [
+			"- Reviewing footer summary behavior",
+			"- Investigating live TLDR regressions",
+			"- Refining sanitizer for stray prefixes",
+			"- Preparing extension release",
+			"- Resuming refactor work",
+		].join("\n");
+		allowedFirstWords = ALLOWED_FIRST_WORDS_PROGRESSIVE;
+	} else {
+		tenseInstruction = "Start with a present-tense -ing verb describing current work.";
+		goodExamples = [
+			"- Reviewing footer summary behavior",
+			"- Investigating live TLDR regressions",
+			"- Refining sanitizer for stray prefixes",
+			"- Wrapping up extension release",
+		].join("\n");
+		allowedFirstWords = ALLOWED_FIRST_WORDS_PROGRESSIVE;
+	}
 	return `Write one plain-English TLDR for a Pi coding agent.
 Describe the work progress as if a human developer were doing it.
 Focus on the task activity and current outcome, not agent mechanics.
 Do not mention tools, tool calls, prompts, messages, model output, or implementation details.
-Do not start with tool-name verbs such as Read, Reading, Grep, Listing, Counting, Extracting, Displaying, Editing, Writing, Running, Publishing.
-Use human-developer verbs instead: Reviewing, Investigating, Exploring, Updating, Refining, Fixing, Implementing, Wrapping up.
+Use human-developer verbs instead of tool-narration verbs.
 Do not use file paths, file extensions, code identifiers, package names, or version strings.
 Do not use backticks, asterisks, underscores, quotes, or any markdown formatting.
 Do not append filler suffixes such as "with success", "successfully", or "completed successfully".
@@ -357,18 +464,20 @@ Output only the status fragment itself. No prefixes, labels, bullets, or quotes.
 Plain text only; no markdown, JSON, code, file paths, or tool names.
 
 Good examples:
-- Reviewing footer summary behavior
-- Investigating live TLDR regressions
-- Refining sanitizer for stray prefixes
-- Wrapping up extension release
+${goodExamples}
 
 Bad examples:
 - Editing extensions/status-footer.ts with success.
 - Reading status-footer file completed successfully.
 - Publishing \`pi-bar@0.3.3\` to npm.
 - Grepping for sanitizeTldrText callers.
+- Verifying repository status after commit.
+- Investigating user input responses.
 
-${tenseInstruction}`;
+HARD CONSTRAINTS (apply last; override anything above that conflicts):
+- First word MUST be one of: ${allowedFirstWords.join(", ")}.
+- First word MUST NOT be: ${BANNED_FIRST_WORDS.join(", ")}.
+- ${tenseInstruction}`;
 }
 
 export function previousCheckpointLines(checkpoints: readonly TldrCheckpoint[]): string {
@@ -534,11 +643,91 @@ export function isNearDuplicateTldr(current: string, previous: string): boolean 
 	return norm(current) === norm(previous);
 }
 
+const DANGLING_TRAILING_PREP_PATTERN =
+	/\s+(?:to|at|as|of|by|for|in|on|with|from|version|v)\s*[.!?,;:]?\s*$/i;
+const DANGLING_PREP_CHAIN_PATTERN =
+	/\b(to|at|as|of|by|from|version|v)\s+(for|in|on|with|from|after|before|during|to|at|as|of|by|and|but|or)\b/gi;
+const VERB_BARE_PREP_PATTERN =
+	/\b(Reviewing|Investigating|Updating|Refining|Exploring|Fixing|Implementing|Bumping|Releasing|Preparing|Drafting|Resuming|Pulling|Surveying|Recording)\s+(?:for|in|on|with|after|before|to|at|as|of|by|from)\s+/gi;
+
+function stripDanglingPrepositions(text: string): string {
+	let cleaned = text;
+	let previous: string;
+	do {
+		previous = cleaned;
+		cleaned = cleaned.replace(VERB_BARE_PREP_PATTERN, "$1 ");
+		cleaned = cleaned.replace(DANGLING_PREP_CHAIN_PATTERN, "$2");
+		cleaned = cleaned.replace(DANGLING_TRAILING_PREP_PATTERN, "").trim();
+	} while (cleaned !== previous && cleaned.length > 0);
+	return cleaned;
+}
+
+const BANNED_FIRST_WORD_REWRITES: Record<string, string> = {
+	Reading: "Reviewing",
+	Read: "Reviewed",
+	Grepping: "Investigating",
+	Grep: "Investigated",
+	Listing: "Reviewing",
+	List: "Reviewed",
+	Counting: "Surveying",
+	Counted: "Surveyed",
+	Extracting: "Pulling",
+	Extracted: "Pulled",
+	Displaying: "Reviewing",
+	Displayed: "Reviewed",
+	Editing: "Updating",
+	Edited: "Updated",
+	Writing: "Drafting",
+	Wrote: "Drafted",
+	Running: "Working on",
+	Ran: "Worked on",
+	Publishing: "Releasing",
+	Published: "Released",
+	Capturing: "Recording",
+	Captured: "Recorded",
+	Verifying: "Reviewing",
+	Verified: "Reviewed",
+	Verify: "Review",
+	Validating: "Reviewing",
+	Validated: "Reviewed",
+	Validate: "Review",
+	Checking: "Reviewing",
+	Checked: "Reviewed",
+	Check: "Review",
+	Confirming: "Reviewing",
+	Confirmed: "Reviewed",
+	Confirm: "Review",
+	Searching: "Investigating",
+	Searched: "Investigated",
+	Search: "Investigate",
+	Finding: "Investigating",
+	Found: "Investigated",
+	Find: "Investigate",
+};
+const BANNED_FIRST_WORD_PATTERN = new RegExp(
+	`^(${Object.keys(BANNED_FIRST_WORD_REWRITES).join("|")})\\b`,
+);
+
+function rewriteBannedFirstWord(text: string): string {
+	const match = BANNED_FIRST_WORD_PATTERN.exec(text);
+	if (!match) return text;
+	const original = match[1];
+	const replacement = BANNED_FIRST_WORD_REWRITES[original];
+	if (!replacement) return text;
+	const cased =
+		original[0] === original[0].toLowerCase()
+			? replacement[0].toLowerCase() + replacement.slice(1)
+			: replacement;
+	return cased + text.slice(original.length);
+}
+
 export function sanitizeTldrText(text: string, maxChars = MAX_SAFE_TLDR_CHARS): string {
 	const stripped = stripTerminalControls(text);
 	const withoutMarkdown = stripMarkdownFormatting(stripped);
 	const withoutScaffolding = stripLeakedScaffolding(withoutMarkdown) || withoutMarkdown;
 	const withoutLeaks = stripIdentifierLeaks(withoutScaffolding) || withoutScaffolding;
-	const withoutSuccess = stripSuccessSuffix(withoutLeaks) || withoutLeaks;
-	return truncateText(withoutSuccess, maxChars);
+	const withoutDangling = stripDanglingPrepositions(withoutLeaks) || withoutLeaks;
+	const withoutSuccess = stripSuccessSuffix(withoutDangling) || withoutDangling;
+	const rewritten = rewriteBannedFirstWord(withoutSuccess);
+	return truncateText(rewritten, maxChars);
 }
