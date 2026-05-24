@@ -1,0 +1,26 @@
+extensions/status-footer.ts
+  s_ef2f72e7523b5c::t_5f18080aa75fb7 1677-1682,2124
+  s_ef2f72e7523b5c::t_1c0379d1d55274 1658
+  s_ef2f72e7523b5c::t_455dff66d9c511 48,1528,1536-1538,1611
+  s_ef2f72e7523b5c::t_a564af133c6b90 2030-2043,2046
+  s_ef2f72e7523b5c::t_065e90996eb67d 2058
+  s_ef2f72e7523b5c::t_7283f48cb28bdc 2086-2089,2094,2103
+README.md
+  s_ef2f72e7523b5c::t_0da1a813809483 88-105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "0917b86c02a0f71c867757a50baf9c94f72c8dcd",
+  "prompts": {},
+  "sessions": {
+    "s_ef2f72e7523b5c": {
+      "agent_id": {
+        "tool": "pi",
+        "id": "019e5a8d-aa6a-7069-a0e1-d9102b67d767",
+        "model": "deepseek-v4-pro"
+      },
+      "human_author": "aizigao <weixiangzhe@live.com>"
+    }
+  }
+}
