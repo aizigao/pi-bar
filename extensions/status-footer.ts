@@ -132,7 +132,7 @@ const SEGMENT_LABELS: Record<SegmentName, string> = {
 const DEFAULT_WARNING_THRESHOLD = 70;
 const DEFAULT_ERROR_THRESHOLD = 90;
 
-const SEGMENT_SEPARATOR = "❯";
+const SEGMENT_SEPARATOR = "›";
 const EXTENSION_STATUS_SEPARATOR = SEGMENT_SEPARATOR;
 
 function formatTokens(n: number): string {
@@ -176,6 +176,19 @@ function thinkingColor(level: string): ThemeColor {
 			return "thinkingXhigh";
 		default:
 			return "thinkingText";
+	}
+}
+
+function formatThinkingLevel(level: string): string {
+	switch (level) {
+		case "minimal":
+		case "min":
+			return "mini";
+		case "medium":
+		case "med":
+			return "med";
+		default:
+			return level;
 	}
 }
 
@@ -1538,11 +1551,7 @@ function formatExtensionStatuses(
 			seenStatusKeys.add(key);
 			return shouldShowStatus(key, filter);
 		})
-		.map(([key, text]) =>
-			stripTerminalControls(
-				hideLabels ? text : `${stripTerminalControls(key)}:${text}`,
-			),
-		);
+		.map(([key, text]) => (hideLabels ? text : `${stripTerminalControls(key)}:${text}`));
 
 	return parts.length > 0 ? parts : null;
 }
@@ -2121,12 +2130,13 @@ export default function (pi: ExtensionAPI) {
 					requestRender = undefined;
 				},
 				invalidate() {},
-				render(width: number): string[] {
-					const modelName = formatModelName(ctx.model);
-					const thinkingLevel = String(pi.getThinkingLevel());
-					const extensionStatusParts = formatExtensionStatuses(
-						footerData?.getExtensionStatuses?.() ?? new Map(),
-						statusFilter,
+					render(width: number): string[] {
+						const modelName = formatModelName(ctx.model);
+						const thinkingLevel = String(pi.getThinkingLevel());
+						const thinkingLabel = formatThinkingLevel(thinkingLevel);
+						const extensionStatusParts = formatExtensionStatuses(
+							footerData?.getExtensionStatuses?.() ?? new Map(),
+							statusFilter,
 						seenStatusKeys,
 						hideLabels,
 					);
@@ -2141,15 +2151,20 @@ export default function (pi: ExtensionAPI) {
 						? `${usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "—%"} / ${formatTokens(usage.contextWindow)}`
 						: "—";
 					const progressText = progress.text();
+					const showModel = visibleSegments.includes("model");
+					const showThinking = visibleSegments.includes("thinking");
 
 					const extensionStatuses = extensionStatusParts
 						? extensionStatusParts
-							.map((part) => theme.fg("text", part))
 							.join(` ${theme.fg("dim", EXTENSION_STATUS_SEPARATOR)} `)
 						: null;
 					const segmentRenderers: Record<SegmentName, string | null> = {
-						model: theme.fg("accent", modelName),
-						thinking: theme.fg(thinkingColor(thinkingLevel), `think:${thinkingLevel}`),
+						model: showModel
+							? theme.fg("accent", showThinking ? `${modelName}:${thinkingLabel}` : modelName)
+							: null,
+						thinking: showThinking && !showModel
+							? theme.fg(thinkingColor(thinkingLevel), `think:${thinkingLabel}`)
+							: null,
 						context: theme.fg(contextSegmentColor, contextText),
 						progress: progressText ? theme.fg("text", progressText) : null,
 						extensions: extensionStatuses,
