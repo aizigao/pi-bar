@@ -6,7 +6,7 @@
 **Never accidentally run Opus on a typo again.** pi-bar keeps your model, thinking level, context pressure, a live progress update, and any extension statuses visible in pi's footer.
 
 ```text
-claude-opus-4.7  ❯  think:med  ❯  2.6% / 1.0M  ❯  Reviewing package structure  ❯  plan:active ❯ queue:2
+anthropic/claude-opus-4.7  ❯  think:med  ❯  2.6% / 1.0M  ❯  Reviewing package structure  ❯  plan:active ❯ queue:2
 ```
 
 ![pi-bar with low context usage](https://cdn.jsdelivr.net/npm/pi-bar@0.3.38/assets/screenshot-green.png)
@@ -15,7 +15,7 @@ claude-opus-4.7  ❯  think:med  ❯  2.6% / 1.0M  ❯  Reviewing package struct
 
 ## Why use it?
 
-- **See the active model at a glance** — catch accidental model switches before an expensive or sensitive task starts.
+- **See the active model and provider at a glance** — catch accidental model switches before an expensive or sensitive task starts.
 - **Track thinking level in place** — immediately notice when you are using the wrong reasoning setting.
 - **Watch context pressure early** — context usage turns green, yellow, then red as you approach the limit.
 - **Follow what pi is doing** — a one-line progress update keeps the current task visible without scrolling.

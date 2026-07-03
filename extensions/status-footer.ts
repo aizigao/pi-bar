@@ -147,10 +147,14 @@ function formatTokens(n: number): string {
 	return `${n}`;
 }
 
-function formatModelName(id: string | undefined): string {
-	if (!id) return "no-model";
-	const base = id.includes("/") ? (id.split("/").pop() ?? id) : id;
-	return base.replace(/-\d{8}$/, "").replace(/-\d{4}-\d{2}-\d{2}$/, "");
+function formatModelName(model: { id: string; provider?: string } | undefined): string {
+	if (!model?.id) return "no-model";
+	const provider = model.id.includes("/") ? undefined : model.provider;
+	const rawModelId = model.id.includes("/") ? model.id.split(/\/(.+)/, 2)[1] : model.id;
+	const modelId = (rawModelId ?? model.id)
+		.replace(/-\d{8}$/, "")
+		.replace(/-\d{4}-\d{2}-\d{2}$/, "");
+	return provider ? `${provider}/${modelId}` : modelId;
 }
 
 function thinkingColor(level: string): ThemeColor {
@@ -2118,7 +2122,7 @@ export default function (pi: ExtensionAPI) {
 				},
 				invalidate() {},
 				render(width: number): string[] {
-					const modelName = formatModelName(ctx.model?.id);
+					const modelName = formatModelName(ctx.model);
 					const thinkingLevel = String(pi.getThinkingLevel());
 					const extensionStatusParts = formatExtensionStatuses(
 						footerData?.getExtensionStatuses?.() ?? new Map(),
@@ -2151,7 +2155,7 @@ export default function (pi: ExtensionAPI) {
 						extensions: extensionStatuses,
 					};
 
-					const separator = `  ${theme.fg("dim", SEGMENT_SEPARATOR)}  `;
+					const separator = ` ${theme.fg("dim", SEGMENT_SEPARATOR)} `;
 					const line = visibleSegments
 						.map((segment) => segmentRenderers[segment])
 						.filter((segment): segment is string => segment !== null)
